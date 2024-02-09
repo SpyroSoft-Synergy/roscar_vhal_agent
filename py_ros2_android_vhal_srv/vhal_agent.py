@@ -2,78 +2,80 @@
 
 import rclpy
 import gpiod
+import threading
 import time
 
 from ros2_android_vhal.srv import SetVehicleProperty
 from rclpy.node import Node
 
 
-class X9C103:
-    def __init__(self, cs_chip, cs_offset, inc_chip, inc_offset, ud_chip, ud_offset):
-        self.resistance = 0
-        self.chip = gpiod.Chip(cs_chip)
+class PWMCtrl:
+    def __init__(self, gpio_chip, pwm_line, frequency):
+        self.chip = gpiod.Chip(gpio_chip)
+        self.pwm_line = self.chip.get_line(pwm_line)
+        self.pwm_line.request(consumer="VHAL Agent", type=gpiod.LINE_REQ_DIR_OUT)
+        self.pwm_line.set_value(0)
 
-        self.cs_line = self.chip.get_line(cs_offset)
-        self.inc_line = self.chip.get_line(inc_offset)
-        self.ud_line = self.chip.get_line(ud_offset)
+        duty_cycle = 0.3
+        self.period = 1.0 / frequency
+        self.high_time = self.period * duty_cycle
+        self.low_time = self.period - self.high_time
+        self.running = True
+        self.lock = threading.Lock()
 
-        self.cs_line.request(consumer='x9c103', type=gpiod.LINE_REQ_DIR_OUT)
-        self.inc_line.request(consumer='x9c103', type=gpiod.LINE_REQ_DIR_OUT)
-        self.ud_line.request(consumer='x9c103', type=gpiod.LINE_REQ_DIR_OUT)
+        self.thread = threading.Thread(target=self.run)
+        self.thread.start()
 
-        self.cs_line.set_value(1)
-        self.inc_line.set_value(0)
-        self.ud_line.set_value(0)
+    def stop(self):
+        self.running = False
+        #if self.thread.is_alive():
+        #    self.thread.join()
 
-        self.shift_resistance(-100)
+    def run(self):
+        while self.running:
+            with self.lock:
+                # Sync the values
+                current_running = self.running
+                current_high_time = self.high_time
+                current_low_time = self.low_time
 
-    def shift_resistance(self, steps):
-        if steps > 0:
-            self.ud_line.set_value(1)
+            if self.high_time > 0:
+                self.pwm_line.set_value(1)
+                time.sleep(self.high_time)
+
+            self.pwm_line.set_value(0)
+            time.sleep(self.low_time)
+
+    def set_speed(self, fan_speed):
+        if fan_speed < 1 or fan_speed > 6:
+            print(f'set_fan_speed error - invalid value: {fan_speed}')
         else:
-            self.ud_line.set_value(0)
-
-        self.cs_line.set_value(0)
-        time.sleep(0.01)
-
-        for _ in range(abs(steps)):
-            self.inc_line.set_value(1)
-            time.sleep(0.01)
-            self.inc_line.set_value(0)
-            time.sleep(0.01)
-
-        self.cs_line.set_value(1)
-
-    def set_resistance(self, steps):
-        self.shift_resistance(steps - self.resistance)
+            print(f'set_fan_speed: {fan_speed}')
+            duty_cycle = (fan_speed - 1) * 0.2
+            self.high_time = self.period * duty_cycle
+            self.low_time = self.period - self.high_time
 
     def cleanup(self):
-        self.shift_resistance(-100)
-        self.cs_line.release()
-        self.inc_line.release()
-        self.ud_line.release()
+        self.stop()
+        self.pwm_line.set_value(0)
+        self.pwm_line.release()
 
-
-def step_for_voltage(v):
-    if v > 12:
-        v = 12
-    return round(v/0.12)
 
 class VehiclePropertyService(Node):
 
-    def __init__(self, x9c103):
+    def __init__(self, pwm_ctrl):
         super().__init__('ros2_android_vhal_service')
         print('Creating service')
-        self.set_property_srv = self.create_service(SetVehicleProperty, 'SetVehicleProperty', self.set_vhal_property_callback)
+        self.set_property_srv = self.create_service(SetVehicleProperty, 'set_vehicle_property', self.set_vhal_property_callback)
         print('Service created')
-        self.x9c103 = x9c103
+        self.pwm_ctrl = pwm_ctrl
 
     def set_vhal_property_callback(self, request, response):
         if request.prop.prop_id != 290459441:
             self.get_logger().info('Set property: %d \n' % (request.prop.prop_id))
 
             # HVAC_FAN_SPEED
-            if request.prop.prop_id == 0x15400500:
+            if request.prop.prop_id == 356517120:
                 self.handle_fan_speed(request.prop)
 
         response.result = True
@@ -81,22 +83,21 @@ class VehiclePropertyService(Node):
 
     def handle_fan_speed(self, request):
         if request.int32_values:
-            volts = request.int32_values[0] * 2
-            steps = round(volts/0.12)
-            self.x9c103.set_resistance(steps)
+            print(f'handle_fan_speed: {request.int32_values[0]}')
+            self.pwm_ctrl.set_speed(request.int32_values[0])
 
 
 
 def main():
     try:  
         rclpy.init()
-        x9c103 = X9C103(cs_chip='gpiochip0', cs_offset=43, inc_chip='gpiochip0', inc_offset=42, ud_chip='gpiochip0', ud_offset=55)
-        service = VehiclePropertyService(x9c103)
+        fan_ctrl = PWMCtrl(gpio_chip='gpiochip0', pwm_line=23, frequency=70)
+        service = VehiclePropertyService(fan_ctrl)
         rclpy.spin(service)
 
     except KeyboardInterrupt:
-        x9c103.cleanup()
-        rclpy.shutdown()
+        fan_ctrl.cleanup()
+        #rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

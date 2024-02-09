@@ -12,7 +12,7 @@ class VehiclePropertyclient(Node):
 
     def __init__(self):
         super().__init__('ros2_android_vhal_client')
-        self.set_property_client = self.create_client(SetVehicleProperty, 'SetVehicleProperty')
+        self.set_property_client = self.create_client(SetVehicleProperty, 'set_vehicle_property')
         while not self.set_property_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('service not available, waiting...')
         
@@ -21,6 +21,7 @@ class VehiclePropertyclient(Node):
     def send_request(self, value):
         if value < 0 or value > 5:
             self.get_logger().error('Invalid request value, must be 0-5')
+            exit(1)
         self.req.prop.timestamp = 0
         self.req.prop.area_id = 0
         self.req.prop.prop_id = 0x15400500
